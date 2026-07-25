@@ -15,15 +15,9 @@ The whole pipeline — PDF generation, chunking, vector indexing, structured dat
 Fully built and deployed, end to end:
 
 - All 5 notebooks have run successfully against workspace `dbc-698fb84c-be59.cloud.databricks.com` (`workspace.insurance`).
-- `insurance_rag_router` is at **model version 5** in Unity Catalog, served by the `insurance-rag-router` endpoint.
+- `insurance_rag_router` is registered in Unity Catalog and served by the `insurance-rag-router` endpoint.
 - A Databricks App chat UI (`insurance-rag-chat`) is live at `https://insurance-rag-chat-2089982741044620.aws.databricksapps.com`, wired to the endpoint via a scoped app resource (`CAN_QUERY`, no manual token handling).
-
-**v3 → v5 changelog** (see [Operational notes](#operational-notes) for the *why*):
-- **v3**: initial deploy — broke shortly after, due to a stale PAT secret hard-set as a served-entity env var that shadowed the auto-vended resource credentials. Removed the override; endpoint fell back to resource-vended auth correctly.
-- **v4**: added `history_json` — a caller-supplied list of recent `{question, source_used, answer}` turns — so the intent classifier and SQL generator can resolve follow-up references ("give me the details") instead of treating every question as context-free.
-- **v5**: extended the same history to the vector-search path (`_resolve_search_query`), so document-lookup follow-ups ("what is the premium for this?") also resolve correctly instead of retrieving irrelevant chunks or getting hallucinated answers.
-- Each new version required a fresh `GRANT SELECT` on `customers`/`transactions` for that version's auto-provisioned system identity — this is a recurring step, not a one-time setup cost (see operational notes).
-- The chat app (`app.py`, deployed by notebook 05) sends `history_json` on every request and includes a `@DataArchitectStudio` background watermark.
+- The agent accepts a caller-supplied `history_json` field (recent `{question, source_used, answer}` turns) so the intent classifier, SQL generator, and vector search can all resolve follow-up references ("give me the details", "what is the premium for this?") instead of treating every question as context-free. The chat app sends this on every request and includes a `@DataArchitectStudio` background watermark.
 
 ---
 
@@ -126,7 +120,7 @@ flowchart TB
 | Structured data | Delta table `customers` | 80 synthetic policyholders, FK to policy_number |
 | Structured data | Delta table `transactions` | 400 synthetic premium/claim/refund records |
 | Reasoning | Foundation Model API | `databricks-meta-llama-3-3-70b-instruct` for classification, SQL generation, and answer synthesis |
-| Orchestration | MLflow pyfunc model | `InsuranceRAGRouter`, registered as `workspace.insurance.insurance_rag_router` (currently v5) |
+| Orchestration | MLflow pyfunc model | `InsuranceRAGRouter`, registered as `workspace.insurance.insurance_rag_router` |
 | Serving | Model Serving endpoint | `insurance-rag-router` (scale-to-zero enabled) |
 | Front end | Databricks App | `insurance-rag-chat` — Streamlit chat UI, calls the endpoint via a scoped `CAN_QUERY` app resource |
 
