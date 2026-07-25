@@ -19,6 +19,8 @@ Fully built and deployed, end to end:
 - A Databricks App chat UI (`insurance-rag-chat`) is live at `https://insurance-rag-chat-2089982741044620.aws.databricksapps.com`, wired to the endpoint via a scoped app resource (`CAN_QUERY`, no manual token handling).
 - The agent accepts a caller-supplied `history_json` field (recent `{question, source_used, answer}` turns) so the intent classifier, SQL generator, and vector search can all resolve follow-up references ("give me the details", "what is the premium for this?") instead of treating every question as context-free. The chat app sends this on every request and includes a `@DataArchitectStudio` background watermark.
 
+![Health Insurance Assistant chat UI](assets/chat-ui-screenshot.png)
+
 ---
 
 ## What problem this solves
