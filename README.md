@@ -10,6 +10,23 @@ The whole pipeline — PDF generation, chunking, vector indexing, structured dat
 
 ---
 
+## Current status
+
+Fully built and deployed, end to end:
+
+- All 5 notebooks have run successfully against workspace `dbc-698fb84c-be59.cloud.databricks.com` (`workspace.insurance`).
+- `insurance_rag_router` is at **model version 5** in Unity Catalog, served by the `insurance-rag-router` endpoint.
+- A Databricks App chat UI (`insurance-rag-chat`) is live at `https://insurance-rag-chat-2089982741044620.aws.databricksapps.com`, wired to the endpoint via a scoped app resource (`CAN_QUERY`, no manual token handling).
+
+**v3 → v5 changelog** (see [Operational notes](#operational-notes) for the *why*):
+- **v3**: initial deploy — broke shortly after, due to a stale PAT secret hard-set as a served-entity env var that shadowed the auto-vended resource credentials. Removed the override; endpoint fell back to resource-vended auth correctly.
+- **v4**: added `history_json` — a caller-supplied list of recent `{question, source_used, answer}` turns — so the intent classifier and SQL generator can resolve follow-up references ("give me the details") instead of treating every question as context-free.
+- **v5**: extended the same history to the vector-search path (`_resolve_search_query`), so document-lookup follow-ups ("what is the premium for this?") also resolve correctly instead of retrieving irrelevant chunks or getting hallucinated answers.
+- Each new version required a fresh `GRANT SELECT` on `customers`/`transactions` for that version's auto-provisioned system identity — this is a recurring step, not a one-time setup cost (see operational notes).
+- The chat app (`app.py`, deployed by notebook 05) sends `history_json` on every request and includes a `@DataArchitectStudio` background watermark.
+
+---
+
 ## What problem this solves
 
 Instead of hand-writing and maintaining a large number of Unity Catalog SQL functions to expose every possible query pattern to an LLM, this project uses a **single routing agent** that decides at query time which retrieval strategy fits the question, then dynamically generates the SQL or vector query it needs. That keeps the surface area small: two Delta tables, one vector index, one agent.
@@ -55,15 +72,17 @@ flowchart TB
         direction LR
         MLF["MLflow pyfunc model<br/>registered to Unity Catalog"]
         EP(["Model Serving Endpoint<br/>insurance-rag-router"])
+        APPUI["Databricks App<br/>insurance-rag-chat (Streamlit)"]
     end
 
-    USER(["User / App"])
+    USER(["End User"])
 
     PDF --> N1 --> VOL --> N2 --> CHUNKS --> VSIDX
     RAW --> N3 --> CUST
     RAW --> N3 --> TXN
 
-    USER -->|"question"| CLASSIFY
+    USER -->|"question"| APPUI
+    APPUI -->|"question + history_json"| CLASSIFY
     CLASSIFY -->|"structured data needed"| SQLPATH
     CLASSIFY -->|"policy knowledge needed"| VECPATH
     CLASSIFY -->|"both needed"| HYBRID
@@ -77,9 +96,10 @@ flowchart TB
     SQLPATH --> SYNTH
     VECPATH --> SYNTH
     HYBRID --> SYNTH
-    SYNTH -->|"answer"| USER
+    SYNTH -->|"answer"| APPUI
+    APPUI -->|"answer"| USER
 
-    AGENT --> MLF --> EP -.->|serves| USER
+    AGENT --> MLF --> EP -.->|"CAN_QUERY"| APPUI
 
     classDef notebook fill:#4C72B0,stroke:#2A3F5F,color:#fff
     classDef storage fill:#55A868,stroke:#2E5C39,color:#fff
@@ -88,7 +108,7 @@ flowchart TB
     class N1,N2,N3 notebook
     class VOL,CHUNKS,VSIDX,CUST,TXN storage
     class CLASSIFY,SQLPATH,VECPATH,HYBRID,SYNTH agent
-    class MLF,EP deploy
+    class MLF,EP,APPUI deploy
 ```
 
 **Design principle:** the agent never needs a growing library of pre-defined UC functions. It has exactly two capabilities — *run a generated SQL query* and *run a vector similarity search* — and an LLM classification step decides which one(s) a given question needs.
@@ -106,8 +126,9 @@ flowchart TB
 | Structured data | Delta table `customers` | 80 synthetic policyholders, FK to policy_number |
 | Structured data | Delta table `transactions` | 400 synthetic premium/claim/refund records |
 | Reasoning | Foundation Model API | `databricks-meta-llama-3-3-70b-instruct` for classification, SQL generation, and answer synthesis |
-| Orchestration | MLflow pyfunc model | `InsuranceRAGRouter`, registered as `workspace.insurance.insurance_rag_router` |
+| Orchestration | MLflow pyfunc model | `InsuranceRAGRouter`, registered as `workspace.insurance.insurance_rag_router` (currently v5) |
 | Serving | Model Serving endpoint | `insurance-rag-router` (scale-to-zero enabled) |
+| Front end | Databricks App | `insurance-rag-chat` — Streamlit chat UI, calls the endpoint via a scoped `CAN_QUERY` app resource |
 
 ---
 
@@ -121,9 +142,10 @@ Run the notebooks in this exact order — each phase depends on the Delta tables
 | 2 | [`02_pdf_to_vector_index.py`](02_pdf_to_vector_index.py) | Parses the PDFs, chunks the text, writes `policy_chunks` Delta table, creates the Vector Search endpoint + Delta Sync index, and runs test similarity queries | Step 1 |
 | 3 | [`03_generate_structured_data.py`](03_generate_structured_data.py) | Generates synthetic `customers` and `transactions` Delta tables with policy-number foreign keys, adds column comments for LLM SQL-generation context | Step 1 (shares policy numbers) |
 | 4 | [`04_rag_router_agent.py`](04_rag_router_agent.py) | Defines the `InsuranceRAGRouter` agent (classify → SQL / vector / hybrid → synthesize), runs a functional test, logs and registers the model to Unity Catalog | Steps 2 & 3 |
-| — | *(manual, one-time)* | Deploy a Model Serving endpoint from the registered model version; grant `SELECT` on the two Delta tables to whatever identity the endpoint's SQL Warehouse resource runs as | Step 4 |
+| 5 | [`05_deploy_insurance_rag_app.ipynb`](05_deploy_insurance_rag_app.ipynb) | Writes a Streamlit chat UI (`app.py`) to a workspace folder, creates a Databricks App wired to the `insurance-rag-router` endpoint (`CAN_QUERY` resource grant), and deploys it | Step 4 (endpoint must exist and be READY) |
+| — | *(manual, one-time — and again after every model re-log)* | Deploy/point the Model Serving endpoint at the current registered model version; grant `SELECT` on the two Delta tables to that version's auto-provisioned SQL Warehouse identity | Step 4 |
 
-Notebooks 1 and 3 can run in parallel (no dependency between them); notebook 2 needs notebook 1's PDFs, and notebook 4 needs both 2 and 3 complete before its functional test will fully pass.
+Notebooks 1 and 3 can run in parallel (no dependency between them); notebook 2 needs notebook 1's PDFs, notebook 4 needs both 2 and 3 complete before its functional test will fully pass, and notebook 5 needs the serving endpoint already deployed and answering (it waits on and smoke-tests it before creating the app).
 
 ---
 
@@ -149,4 +171,10 @@ See [`00_project_prompt.md`](00_project_prompt.md) for the original phase-by-pha
 
 - **Foundation model choice matters**: some premium-tier models may be rate-limited to 0 QPS on trial/sandbox workspaces. Verify your chosen `LLM_ENDPOINT` responds to a direct test query before wiring it into the agent.
 - **Resource-vended auth covers compute, not data**: declaring `DatabricksSQLWarehouse` / `DatabricksVectorSearchIndex` as MLflow model `resources` grants the serving endpoint permission to *use* that compute, but Unity Catalog table-level `SELECT` grants must still be applied explicitly to whatever identity executes the query.
+- **That identity is per model VERSION, not per endpoint**: every time `insurance_rag_router` is re-logged (a new UC model version), Model Serving auto-provisions a *new* system service principal for `DatabricksSQLWarehouse` access — it is not reused across versions. After logging a new version and pointing the endpoint at it, find its identity (e.g. ask the model to run `SELECT current_user()`) and re-run the `GRANT SELECT` statements on `customers`/`transactions` for that new identity, or SQL-path questions will fail with `INSUFFICIENT_PERMISSIONS` even though the previous version worked fine.
+- **The router model is stateless per call** — it has no memory of previous questions. Follow-ups like "give me the details" or "what is the premium for this?" are sent to the model with zero context unless the caller supplies it. The app (and `predict()`) pass a `history_json` field (last few `{question, source_used, answer}` turns) alongside `question` specifically so the classifier, SQL generator, and vector search can resolve pronouns/references — without it, follow-ups get misrouted or the LLM hallucinates an answer instead of admitting it doesn't have one.
 - All data in this project is **synthetic** — generated for demonstration purposes only, not real policyholder or claims data.
+
+---
+
+© 2026 @DataArchitectStudio. All rights reserved.
